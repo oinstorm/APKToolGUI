@@ -30,6 +30,7 @@
                 <MenuItem x:Name="menuSaveLog" Header="Save log to file" Click="SaveLog_Click"/>
                 <Separator/>
                 <MenuItem x:Name="menuOpenTemp" Header="Open temp folder" Click="OpenTempFolder_Click"/>
+                <MenuItem x:Name="menuClearTemp" Header="Clear temp folder" Click="ClearTempFolder_Click"/>
                 <MenuItem x:Name="menuExportDiagnostics" Header="Export diagnostic snapshot..." Click="ExportDiagnostics_Click"/>
                 <Separator/>
                 <MenuItem x:Name="menuExit" Header="Exit" Click="Exit_Click"/>
