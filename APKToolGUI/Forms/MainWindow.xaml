@@ -30,7 +30,7 @@
                 <MenuItem x:Name="menuSaveLog" Header="Save log to file" Click="SaveLog_Click"/>
                 <Separator/>
                 <MenuItem x:Name="menuOpenTemp" Header="Open temp folder" Click="OpenTempFolder_Click"/>
-                <MenuItem x:Name="menuClearTemp" Header="Clear temp folder" Click="ClearTempFolder_Click"/>
+                <MenuItem x:Name="menuExportDiagnostics" Header="Export diagnostic snapshot..." Click="ExportDiagnostics_Click"/>
                 <Separator/>
                 <MenuItem x:Name="menuExit" Header="Exit" Click="Exit_Click"/>
             </MenuItem>
@@ -270,9 +270,19 @@
                                          FontFamily="Consolas"/>
                         </TabItem>
                         <TabItem x:Name="signatureTabPage" Header="Signature">
-                            <RichTextBox x:Name="sigTxtBox" Margin="3" IsReadOnly="True"
-                                         VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
-                                         FontFamily="Consolas"/>
+                            <DockPanel Margin="3">
+                                <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="0,0,0,6">
+                                    <Button x:Name="verifySignatureBtn" Content="Verify signature" MinWidth="120" Margin="0,0,6,0"/>
+                                    <Button x:Name="cancelSignatureBtn" Content="Cancel verification" MinWidth="130" IsEnabled="False"/>
+                                </StackPanel>
+                                <StackPanel DockPanel.Dock="Bottom" Margin="0,0,0,6">
+                                    <TextBlock x:Name="signatureStatusText" Text="Not verified" FontWeight="SemiBold" Margin="0,0,0,2"/>
+                                    <TextBlock x:Name="signatureDetailsText" TextWrapping="Wrap" Foreground="{DynamicResource SecondaryText}"/>
+                                </StackPanel>
+                                <RichTextBox x:Name="sigTxtBox" IsReadOnly="True"
+                                             VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
+                                             FontFamily="Consolas"/>
+                            </DockPanel>
                         </TabItem>
                     </TabControl>
                 </TabItem>

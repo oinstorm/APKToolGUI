@@ -319,6 +319,9 @@
     <Compile Include="Controls\WpfTheme.cs" />
     <Compile Include="Controls\NumericUpDown.cs" />
     <Compile Include="Controls\LogView.cs" />
+    <Compile Include="Utils\ProcessRunner.cs" />
+    <Compile Include="Utils\LatestRequestCoordinator.cs" />
+    <Compile Include="Utils\DiagnosticSnapshot.cs" />
     <Compile Include="Utils\AdminUtils.cs" />
     <Compile Include="Utils\ApkIconExtractor.cs" />
     <Compile Include="Utils\BitmapUtils.cs" />
@@ -359,6 +362,7 @@
     </Compile>
     <Compile Include="Java\JavaUtils.cs" />
     <Compile Include="Utils\FileUtils.cs" />
+    <Compile Include="Properties\BuildInfo.cs" />
     <Compile Include="Utils\PathUtils.cs" />
     <Compile Include="Program.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />

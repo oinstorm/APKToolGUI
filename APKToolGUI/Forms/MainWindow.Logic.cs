@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Media;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
@@ -257,13 +258,13 @@ namespace APKToolGUI.Forms
         {
             try
             {
-                ToStatus(Lang.PleaseWait, Res.waiting);
                 apkeditor?.Cancel();
                 apktool?.Cancel();
                 baksmali?.Cancel();
                 smali?.Cancel();
                 zipalign?.Cancel();
                 signapk?.Cancel();
+                CancelSignatureVerification();
             }
             catch (Exception ex)
             {
@@ -933,129 +934,470 @@ namespace APKToolGUI.Forms
 
         #region APK info
 
+        // Only one APK Info request may run at a time; a new selection cancels the previous one so a
+        // stale result can never overwrite the file the user is looking at.
+        private readonly LatestRequestCoordinator<ApkInfoParseOutcome> apkInfoRequests =
+            new LatestRequestCoordinator<ApkInfoParseOutcome>();
+        private readonly ChildProcessTracker apkInfoProcesses = new ChildProcessTracker();
+        private readonly TimeSpan apkInfoProcessTimeout = TimeSpan.FromSeconds(120);
+        private readonly TimeSpan signatureVerifyTimeout = TimeSpan.FromSeconds(180);
+        private readonly System.Diagnostics.Stopwatch diagnosticsProbe = new System.Diagnostics.Stopwatch();
+
+        private CancellationTokenSource signatureVerification;
+        private long signatureVerificationId;
+        private string signatureTargetFile;
+        private string apkInfoStage = "idle";
+        private string signatureStage = "idle";
+        private string lastApkInfoFileName;
+
         internal async Task GetApkInfo(string file)
         {
             if (!File.Exists(file)) return;
 
+            string fullPath = Path.GetFullPath(file);
+            lastApkInfoFileName = Path.GetFileName(fullPath);
+            apkInfoStage = "queued";
+            CancelSignatureVerification();
+
             ToLog(ApktoolEventType.None, Lang.ParsingApkInfo);
             ToStatus(Lang.ParsingApkInfo, Res.waiting);
+            InvokeOnUIThread(() =>
+            {
+                fileTxtBox.Text = fullPath;
+                ResetApkInfoFields();
+                signatureTargetFile = null;
+                SetRich(sigTxtBox, "");
+                UpdateSignatureStatus("Not verified",
+                    "Press \"Verify signature\" to read the certificate. Full verification runs on demand and can be cancelled.");
+            });
+
+            RequestHandle<ApkInfoParseOutcome> handle = apkInfoRequests.Start(fullPath,
+                (requestId, token) => ParseApkRequestAsync(requestId, fullPath, token));
+
+            ApkInfoParseOutcome outcome;
             try
             {
-                string splitPath = Path.Combine(Program.TEMP_PATH, "SplitInfo");
-                var parseResult = await ParseApkInBackgroundAsync(file, splitPath);
-                if (parseResult.Success)
-                {
-                    aapt = parseResult.Aapt;
-                    UpdateApkInfoUI(parseResult);
-                    var signature = await Task.Run(() => signapk.GetSignature(parseResult.ActualFilePath));
-                    InvokeOnUIThread(() => SetRich(sigTxtBox, signature));
-                }
-                ToLog(ApktoolEventType.Success, Lang.Done);
-                ToStatus(Lang.Done, Res.done);
+                outcome = await handle.Completion;
             }
-#if DEBUG
-            catch (Exception ex) { ToLog(ApktoolEventType.Warning, Lang.ErrorGettingApkInfo + "\n" + ex.ToString()); }
-#else
-            catch (Exception) { ToLog(ApktoolEventType.Warning, Lang.ErrorGettingApkInfo); }
-#endif
+            catch (OperationCanceledException)
+            {
+                // Superseded by a newer selection or cancelled: never touch the current UI.
+                return;
+            }
+            catch (Exception ex)
+            {
+                apkInfoStage = "failed";
+                ToLog(ApktoolEventType.Warning, Lang.ErrorGettingApkInfo + " " + ex.Message);
+                ToStatus(Lang.ErrorGettingApkInfo, Res.warning);
+                return;
+            }
+
+            if (!apkInfoRequests.IsCurrent(handle.Id)) return;
+
+            if (outcome.Status != ApkParseStatus.Success)
+            {
+                apkInfoStage = outcome.Status == ApkParseStatus.TimedOut ? "timed out" : "tool failed";
+                ToLog(ApktoolEventType.Warning, Lang.ErrorGettingApkInfo +
+                    (String.IsNullOrEmpty(outcome.Error) ? "" : " (" + outcome.Error + ")"));
+                ToStatus(Lang.ErrorGettingApkInfo, Res.warning);
+                return;
+            }
+
+            aapt = outcome.Aapt;
+            signatureTargetFile = outcome.ActualFilePath;
+            apkInfoStage = "basic info shown";
+
+            ToLog(ApktoolEventType.None, String.Format(
+                "APK Info: basic info {0:0.00}s, icon {1:0.00}s (icon source: {2})",
+                outcome.BasicInfoElapsed.TotalSeconds, outcome.IconElapsed.TotalSeconds,
+                String.IsNullOrEmpty(outcome.IconSource) ? "none" : outcome.IconSource));
+            ToLog(ApktoolEventType.Success, Lang.Done);
+            ToStatus(Lang.Done, Res.done);
+
+            if (Settings.Default.AutoVerifySignature)
+                await VerifySignatureAsync(false);
         }
 
-        private async Task<ApkParseResult> ParseApkInBackgroundAsync(string file, string splitPath)
+        private async Task<ApkInfoParseOutcome> ParseApkRequestAsync(long requestId, string file, CancellationToken token)
         {
-            return await Task.Run(() =>
-            {
-                try
-                {
-                    DirectoryUtils.Delete(splitPath);
-                    List<string> archList = new List<string>();
-                    string actualFile = file;
-                    bool isBundle = file.ContainsAny(".xapk", ".zip", ".apks", ".apkm");
+            var stageWatch = System.Diagnostics.Stopwatch.StartNew();
+            var outcome = new ApkInfoParseOutcome();
+            string splitPath = Path.Combine(Program.TEMP_PATH, "ApkInfo", requestId.ToString());
+            bool isBundle = file.ContainsAny(".xapk", ".zip", ".apks", ".apkm");
 
-                    if (isBundle)
+            try
+            {
+                List<string> archList = new List<string>();
+                string actualFile = file;
+
+                if (isBundle)
+                {
+                    apkInfoStage = "extracting bundle";
+                    token.ThrowIfCancellationRequested();
+                    Directory.CreateDirectory(splitPath);
+                    using (ZipFile zipDest = ZipFile.Read(file))
                     {
-                        Directory.CreateDirectory(splitPath);
-                        using (ZipFile zipDest = ZipFile.Read(file))
+                        bool mainApkFound = false;
+                        foreach (ZipEntry entry in zipDest.Entries)
                         {
-                            bool mainApkFound = false;
-                            foreach (ZipEntry entry in zipDest.Entries)
+                            token.ThrowIfCancellationRequested();
+                            if (!mainApkFound && !entry.FileName.Contains("config.") && entry.FileName.EndsWith(".apk"))
                             {
-                                if (!mainApkFound && !entry.FileName.Contains("config.") && entry.FileName.EndsWith(".apk"))
-                                {
-                                    string extractPath = Path.Combine(splitPath, entry.FileName);
-                                    Directory.CreateDirectory(Path.GetDirectoryName(extractPath));
-                                    entry.Extract(splitPath, ExtractExistingFileAction.OverwriteSilently);
-                                    actualFile = extractPath;
-                                    mainApkFound = true;
-                                }
-                                // Density splits carry the launcher-icon resources, not base.apk;
-                                // extract them so the icon resolver can fall back to them.
-                                else if (entry.FileName.EndsWith(".apk") && entry.FileName.Contains("dpi"))
-                                {
-                                    string extractPath = Path.Combine(splitPath, entry.FileName);
-                                    Directory.CreateDirectory(Path.GetDirectoryName(extractPath));
-                                    entry.Extract(splitPath, ExtractExistingFileAction.OverwriteSilently);
-                                }
-                                if (entry.FileName.Contains("lib/armeabi-v7a") && !archList.Contains("armeabi-v7a")) archList.Add("armeabi-v7a");
-                                if (entry.FileName.Contains("lib/arm64-v8a") && !archList.Contains("arm64-v8a")) archList.Add("arm64-v8a");
-                                if (entry.FileName.Contains("lib/x86") && !archList.Contains("x86")) archList.Add("x86");
-                                if (entry.FileName.Contains("lib/x86_64") && !archList.Contains("x86_64")) archList.Add("x86_64");
+                                string extractPath = Path.Combine(splitPath, entry.FileName);
+                                Directory.CreateDirectory(Path.GetDirectoryName(extractPath));
+                                entry.Extract(splitPath, ExtractExistingFileAction.OverwriteSilently);
+                                actualFile = extractPath;
+                                mainApkFound = true;
                             }
+                            // Density splits carry the launcher-icon resources, not base.apk;
+                            // extract them so the icon resolver can fall back to them.
+                            else if (entry.FileName.EndsWith(".apk") && entry.FileName.Contains("dpi"))
+                            {
+                                string extractPath = Path.Combine(splitPath, entry.FileName);
+                                Directory.CreateDirectory(Path.GetDirectoryName(extractPath));
+                                entry.Extract(splitPath, ExtractExistingFileAction.OverwriteSilently);
+                            }
+                            if (entry.FileName.Contains("lib/armeabi-v7a") && !archList.Contains("armeabi-v7a")) archList.Add("armeabi-v7a");
+                            if (entry.FileName.Contains("lib/arm64-v8a") && !archList.Contains("arm64-v8a")) archList.Add("arm64-v8a");
+                            if (entry.FileName.Contains("lib/x86") && !archList.Contains("x86")) archList.Add("x86");
+                            if (entry.FileName.Contains("lib/x86_64") && !archList.Contains("x86_64")) archList.Add("x86_64");
                         }
                     }
-
-                    var aaptParser = new AaptParser();
-                    var parsed = aaptParser.Parse(actualFile);
-
-                    // Resolve the launcher icon to bytes while the extracted splits still exist on
-                    // disk. The icon itself is never written out — it stays in memory.
-                    byte[] iconBytes = aaptParser.GetIconBytes(actualFile, isBundle ? splitPath : null);
-
-                    DirectoryUtils.Delete(splitPath);
-
-                    return new ApkParseResult { Success = parsed, Aapt = aaptParser, Architecture = string.Join(", ", archList), ActualFilePath = actualFile, IconBytes = iconBytes };
                 }
-                catch (Exception ex)
+
+                apkInfoStage = "reading manifest (aapt)";
+                token.ThrowIfCancellationRequested();
+                var parser = new AaptParser();
+                bool parsed = parser.Parse(actualFile, apkInfoProcessTimeout, token, TrackApkInfoProcess);
+
+                outcome.Aapt = parser;
+                outcome.ActualFilePath = actualFile;
+                outcome.Architecture = string.Join(", ", archList);
+                outcome.BasicInfoElapsed = stageWatch.Elapsed;
+                outcome.Error = parser.LastError;
+                outcome.Status = parsed ? ApkParseStatus.Success : parser.LastStatus;
+
+                if (!parsed)
                 {
-                    Debug.WriteLine($"Error parsing APK: {ex.Message}");
-                    DirectoryUtils.Delete(splitPath);
-                    return new ApkParseResult { Success = false };
+                    apkInfoStage = outcome.Status == ApkParseStatus.TimedOut ? "timed out" : "tool failed";
+                    return outcome;
                 }
-            });
+
+                // Basic information goes to the UI first; the icon never delays it.
+                if (apkInfoRequests.IsCurrent(requestId))
+                {
+                    apkInfoStage = "updating basic info";
+                    InvokeOnUIThread(() =>
+                    {
+                        if (apkInfoRequests.IsCurrent(requestId)) ApplyApkBasicInfo(outcome);
+                    });
+                }
+
+                apkInfoStage = "resolving icon";
+                var iconWatch = System.Diagnostics.Stopwatch.StartNew();
+                byte[] iconBytes = parser.GetIconBytes(actualFile, isBundle ? splitPath : null);
+                outcome.IconBytes = iconBytes;
+                outcome.IconSource = parser.LastIconSource;
+                outcome.IconElapsed = iconWatch.Elapsed;
+                token.ThrowIfCancellationRequested();
+
+                if (apkInfoRequests.IsCurrent(requestId))
+                {
+                    apkInfoStage = "updating icon";
+                    InvokeOnUIThread(() =>
+                    {
+                        if (apkInfoRequests.IsCurrent(requestId)) ApplyApkIcon(iconBytes);
+                    });
+                }
+
+                apkInfoStage = "completed";
+                return outcome;
+            }
+            finally
+            {
+                // The split folder is only consumed by the stages above, so it can go away here.
+                if (isBundle) DirectoryUtils.Delete(splitPath);
+            }
         }
 
-        private void UpdateApkInfoUI(ApkParseResult result)
+        private void TrackApkInfoProcess(int processId, DateTime startedAtUtc)
+        {
+            apkInfoProcesses.Register(processId, apkInfoStage, startedAtUtc);
+        }
+
+        private void ResetApkInfoFields()
         {
             try { previousApkIcon?.Dispose(); previousApkIcon = null; } catch { }
             apkIconPicBox.Source = null;
 
-            fileTxtBox.Text = result.Aapt.ApkFile;
-            appTxtBox.Text = result.Aapt.AppName;
-            packNameTxtBox.Text = result.Aapt.PackageName;
-            verTxtBox.Text = result.Aapt.VersionName;
-            buildTxtBox.Text = result.Aapt.VersionCode;
-            minSdkTxtBox.Text = result.Aapt.MinSdkVersionDetailed;
-            targetSdkTxtBox.Text = result.Aapt.TargetSdkVersionDetailed;
-            screenTxtBox.Text = result.Aapt.Screens;
-            densityTxtBox.Text = result.Aapt.Densities;
-            launchActivityTxtBox.Text = result.Aapt.LaunchableActivity;
-            archSdkTxtBox.Text = !String.IsNullOrEmpty(result.Aapt.NativeCode) ? result.Aapt.NativeCode : result.Architecture;
+            appTxtBox.Text = "";
+            packNameTxtBox.Text = "";
+            verTxtBox.Text = "";
+            buildTxtBox.Text = "";
+            minSdkTxtBox.Text = "";
+            targetSdkTxtBox.Text = "";
+            screenTxtBox.Text = "";
+            densityTxtBox.Text = "";
+            launchActivityTxtBox.Text = "";
+            archSdkTxtBox.Text = "";
+            SetRich(permTxtBox, "");
+            SetRich(localsTxtBox, "");
+            SetRich(fullInfoTextBox, "");
+        }
 
-            SetRich(permTxtBox, result.Aapt.Permissions);
-            SetRich(localsTxtBox, result.Aapt.Locales);
-            SetRich(fullInfoTextBox, result.Aapt.FullInfo);
-            SetRich(sigTxtBox, Lang.Loading);
+        private void ApplyApkBasicInfo(ApkInfoParseOutcome outcome)
+        {
+            AaptParser info = outcome.Aapt;
+            if (info == null) return;
 
-            previousApkIcon = BitmapUtils.LoadBitmap(result.IconBytes);
+            fileTxtBox.Text = info.ApkFile;
+            appTxtBox.Text = info.AppName;
+            packNameTxtBox.Text = info.PackageName;
+            verTxtBox.Text = info.VersionName;
+            buildTxtBox.Text = info.VersionCode;
+            minSdkTxtBox.Text = info.MinSdkVersionDetailed;
+            targetSdkTxtBox.Text = info.TargetSdkVersionDetailed;
+            screenTxtBox.Text = info.Screens;
+            densityTxtBox.Text = info.Densities;
+            launchActivityTxtBox.Text = info.LaunchableActivity;
+            archSdkTxtBox.Text = !String.IsNullOrEmpty(info.NativeCode) ? info.NativeCode : outcome.Architecture;
+
+            SetRich(permTxtBox, info.Permissions);
+            SetRich(localsTxtBox, info.Locales);
+            SetRich(fullInfoTextBox, info.FullInfo);
+        }
+
+        private void ApplyApkIcon(byte[] iconBytes)
+        {
+            try { previousApkIcon?.Dispose(); previousApkIcon = null; } catch { }
+
+            if (iconBytes == null || iconBytes.Length == 0)
+            {
+                apkIconPicBox.Source = null;
+                return;
+            }
+
+            previousApkIcon = BitmapUtils.LoadBitmap(iconBytes);
             apkIconPicBox.Source = ToBitmapSource(previousApkIcon);
         }
 
-        private class ApkParseResult
+        private sealed class ApkInfoParseOutcome
         {
-            public bool Success { get; set; }
+            public ApkParseStatus Status { get; set; }
+            public string Error { get; set; }
             public AaptParser Aapt { get; set; }
             public string Architecture { get; set; }
             public string ActualFilePath { get; set; }
             public byte[] IconBytes { get; set; }
+            public string IconSource { get; set; }
+            public TimeSpan BasicInfoElapsed { get; set; }
+            public TimeSpan IconElapsed { get; set; }
+        }
+
+        #endregion
+
+        #region Signature verification
+
+        private async Task VerifySignatureAsync(bool userInitiated)
+        {
+            string target = signatureTargetFile;
+            if (String.IsNullOrWhiteSpace(target) || !File.Exists(target))
+            {
+                UpdateSignatureStatus("No APK selected",
+                    "Select an APK in the Basic info tab first; verification runs against the file that is shown there.");
+                return;
+            }
+
+            if (signapk == null)
+            {
+                UpdateSignatureStatus("Signature verification unavailable",
+                    "apksigner could not be initialized. Check the Java settings and restart the application.");
+                return;
+            }
+
+            if (signatureVerification != null)
+            {
+                // A manual request replaces the running one; an automatic request does not stack up.
+                if (!userInitiated) return;
+                signatureVerification.Cancel();
+            }
+
+            var cancellation = new CancellationTokenSource();
+            signatureVerification = cancellation;
+            long requestId = ++signatureVerificationId;
+            signatureStage = "running";
+
+            InvokeOnUIThread(() =>
+            {
+                verifySignatureBtn.IsEnabled = false;
+                cancelSignatureBtn.IsEnabled = true;
+                SetRich(sigTxtBox, "");
+                UpdateSignatureStatus("Verifying signature...",
+                    "apksigner may keep the APK open while it reads the signature, so the file cannot be renamed or deleted until this finishes.");
+            });
+
+            ApkSignatureResult result = null;
+            try
+            {
+                result = await Task.Run(() => signapk.VerifySignature(target, signatureVerifyTimeout,
+                    cancellation.Token, TrackSignatureProcess));
+            }
+            catch (Exception ex)
+            {
+                result = new ApkSignatureResult { Status = ApkSignatureStatus.Failed, Output = ex.Message };
+            }
+            finally
+            {
+                cancellation.Dispose();
+                if (ReferenceEquals(signatureVerification, cancellation)) signatureVerification = null;
+            }
+
+            if (requestId != signatureVerificationId) return; // superseded or cancelled by a new selection
+            if (!String.Equals(target, signatureTargetFile, StringComparison.OrdinalIgnoreCase)) return;
+
+            ApplySignatureResult(result);
+        }
+
+        private void TrackSignatureProcess(int processId, DateTime startedAtUtc)
+        {
+            apkInfoProcesses.Register(processId, "signature verify", startedAtUtc);
+        }
+
+        private void ApplySignatureResult(ApkSignatureResult result)
+        {
+            string elapsed = result == null ? "" : String.Format(" ({0:0.00}s)", result.Elapsed.TotalSeconds);
+            switch (result == null ? ApkSignatureStatus.Failed : result.Status)
+            {
+                case ApkSignatureStatus.Success:
+                    signatureStage = "succeeded" + elapsed;
+                    SetRich(sigTxtBox, result.Output);
+                    UpdateSignatureStatus("Signature verified" + elapsed,
+                        "Verification finished; the Java process it started has exited, so the APK is no longer held by this application.");
+                    ToLog(ApktoolEventType.Success, "Signature verification succeeded" + elapsed);
+                    break;
+                case ApkSignatureStatus.Cancelled:
+                    signatureStage = "cancelled";
+                    UpdateSignatureStatus("Verification cancelled",
+                        "The Java process started for this verification was terminated and has exited; no result was written back.");
+                    ToLog(ApktoolEventType.Warning, "Signature verification cancelled");
+                    break;
+                case ApkSignatureStatus.TimedOut:
+                    signatureStage = "timed out" + elapsed;
+                    SetRich(sigTxtBox, result == null ? "" : result.Output);
+                    UpdateSignatureStatus("Verification timed out" + elapsed,
+                        "The verification process exceeded its time limit and was terminated after it exited.");
+                    ToLog(ApktoolEventType.Warning, "Signature verification timed out");
+                    break;
+                default:
+                    signatureStage = "failed" + elapsed;
+                    SetRich(sigTxtBox, result == null ? "" : result.Output);
+                    UpdateSignatureStatus("Verification failed" + elapsed,
+                        result == null ? "No result was produced." : "Exit code " + result.ExitCode + ".");
+                    ToLog(ApktoolEventType.Error, "Signature verification failed");
+                    break;
+            }
+
+            InvokeOnUIThread(() =>
+            {
+                verifySignatureBtn.IsEnabled = true;
+                cancelSignatureBtn.IsEnabled = false;
+            });
+        }
+
+        private void CancelSignatureVerification()
+        {
+            signatureVerificationId++;
+            signatureStage = "not verified";
+            CancellationTokenSource running = signatureVerification;
+            if (running != null)
+            {
+                try { running.Cancel(); }
+                catch (ObjectDisposedException) { }
+            }
+
+            InvokeOnUIThread(() =>
+            {
+                verifySignatureBtn.IsEnabled = true;
+                cancelSignatureBtn.IsEnabled = false;
+            });
+        }
+
+        private void UpdateSignatureStatus(string status, string details)
+        {
+            InvokeOnUIThread(() =>
+            {
+                signatureStatusText.Text = status ?? "";
+                signatureDetailsText.Text = details ?? "";
+            });
+        }
+
+        private async void VerifySignatureBtn_Click(object sender, RoutedEventArgs e)
+        {
+            await VerifySignatureAsync(true);
+        }
+
+        private void CancelSignatureBtn_Click(object sender, RoutedEventArgs e)
+        {
+            CancellationTokenSource running = signatureVerification;
+            if (running == null)
+            {
+                UpdateSignatureStatus("Nothing to cancel", "No signature verification is running.");
+                return;
+            }
+
+            UpdateSignatureStatus("Cancelling verification...", "Waiting for the Java process started by this application to exit.");
+            try { running.Cancel(); }
+            catch (ObjectDisposedException) { }
+        }
+
+        #endregion
+
+        #region Diagnostics
+
+        private void ExportDiagnostics_Click(object sender, RoutedEventArgs e)
+        {
+            // Measure how quickly the UI thread returns to a background-priority callback. This is a
+            // single on-demand sample: nothing is sampled or logged in the background.
+            diagnosticsProbe.Restart();
+            Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Background,
+                new Action(CompleteDiagnosticsExport));
+        }
+
+        private void CompleteDiagnosticsExport()
+        {
+            double? dispatchDelay = diagnosticsProbe.IsRunning ? diagnosticsProbe.Elapsed.TotalMilliseconds : (double?)null;
+            diagnosticsProbe.Stop();
+
+            try
+            {
+                using (var sfd = new WinForms.SaveFileDialog())
+                {
+                    sfd.FileName = "APKToolGUI-diagnostics.txt";
+                    sfd.Filter = Lang.TextFile + " (*.txt)|*.txt";
+                    if (sfd.ShowDialog() != WinForms.DialogResult.OK) return;
+
+                    var input = new DiagnosticSnapshotInput
+                    {
+                        AppVersion = WinForms.Application.ProductVersion,
+                        BuildConfiguration = BuildInfo.BuildConfiguration,
+                        Commit = BuildInfo.Commit,
+                        ProcessStartLocalTime = Process.GetCurrentProcess().StartTime,
+                        ActiveApkInfoRequests = apkInfoRequests.ActiveCount,
+                        ApkInfoStage = apkInfoStage,
+                        LastApkFileName = lastApkInfoFileName,
+                        UiDispatchDelayMilliseconds = dispatchDelay,
+                        SignatureStage = signatureStage,
+                        ChildProcesses = apkInfoProcesses.Snapshot(),
+                    };
+
+                    File.WriteAllText(sfd.FileName, DiagnosticSnapshot.Build(input));
+                }
+                ToLog(ApktoolEventType.None, "Diagnostic snapshot written. Review it before sharing; it describes this machine.");
+            }
+            catch (Exception ex)
+            {
+                ToLog(ApktoolEventType.Error, "Could not write the diagnostic snapshot: " + ex.Message);
+            }
         }
 
         #endregion

@@ -80,6 +80,8 @@ namespace APKToolGUI.Forms
             chkCustomApktool.Content = rm.GetString("SettingsCustomApktool");
             lblTheme.Content = rm.GetString("SettingsTheme");
             chkDebug.Content = Lang.DebugMode;
+            // Keep the XAML caption when the resource key is absent for a language.
+            chkAutoVerifySignature.Content = rm.GetString("SettingsAutoVerifySignature") ?? chkAutoVerifySignature.Content;
             chkIgnoreOutputCM.Content = rm.GetString("SettingsIgnoreOutputCM");
 
             lblAdminRights.Content = rm.GetString("SettingsAdminRights");
@@ -113,6 +115,7 @@ namespace APKToolGUI.Forms
             txtJvmArgs.Text = s.CustomJVMArgs;
             chkUtf8.IsChecked = s.Utf8FilenameSupport;
             chkDebug.IsChecked = s.DebugMode;
+            chkAutoVerifySignature.IsChecked = s.AutoVerifySignature;
             chkCustomApktool.IsChecked = s.UseCustomApktool;
             txtApktoolPath.Text = s.ApktoolPath;
             chkIgnoreOutputCM.IsChecked = s.IgnoreOutputDirContextMenu;
@@ -143,6 +146,7 @@ namespace APKToolGUI.Forms
                 s.CustomJVMArgs = txtJvmArgs.Text;
                 s.Utf8FilenameSupport = chkUtf8.IsChecked == true;
                 s.DebugMode = chkDebug.IsChecked == true;
+                s.AutoVerifySignature = chkAutoVerifySignature.IsChecked == true;
                 s.UseCustomApktool = chkCustomApktool.IsChecked == true;
                 s.ApktoolPath = txtApktoolPath.Text;
                 s.IgnoreOutputDirContextMenu = chkIgnoreOutputCM.IsChecked == true;

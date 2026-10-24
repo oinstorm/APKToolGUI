@@ -294,6 +294,8 @@ namespace APKToolGUI.Forms
 
             // APK info
             selApkFileInfoBtn.Click += SelApkFileInfoBtn_Click;
+            verifySignatureBtn.Click += VerifySignatureBtn_Click;
+            cancelSignatureBtn.Click += CancelSignatureBtn_Click;
             apkIconPicBox.MouseLeftButtonUp += ApkIcon_Click;
             psLinkBtn.Click += (s, e) => { if (aapt != null) Process.Start(aapt.PlayStoreLink); };
             apkComboLinkBtn.Click += (s, e) => { if (aapt != null) Process.Start(aapt.ApkComboLink); };
@@ -399,9 +401,11 @@ namespace APKToolGUI.Forms
             await ListDevices();
         }
 
+
         private void MainWindow_Closing(object sender, CancelEventArgs e)
         {
             Save();
+            try { signatureVerification?.Cancel(); } catch (Exception) { }
             try { previousApkIcon?.Dispose(); previousApkIcon = null; } catch { }
             try
             {

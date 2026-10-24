@@ -4,6 +4,8 @@ using System.Diagnostics;
 using APKToolGUI.Properties;
 using APKToolGUI.Utils;
 using System.IO.Packaging;
+using System.Text;
+using System.Threading;
 
 namespace APKToolGUI
 {
@@ -171,6 +173,61 @@ namespace APKToolGUI
                 return version;
             }
         }
+        /// <summary>
+        /// Verifies the APK signature in a child process created for this call only, so it can be
+        /// cancelled or timed out, and is waited for before resources are released.
+        /// </summary>
+        public ApkSignatureResult VerifySignature(string apkFile, TimeSpan timeout, CancellationToken cancellationToken,
+            Action<int, DateTime> onProcessStarted)
+        {
+            string executable = String.IsNullOrWhiteSpace(JavaPath) ? "java" : JavaPath;
+            string jvmArgs = Settings.Default.UseCustomJVMArgs && !String.IsNullOrWhiteSpace(Settings.Default.CustomJVMArgs)
+                ? Settings.Default.CustomJVMArgs.Trim() + " "
+                : String.Empty;
+
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = executable,
+                Arguments = String.Format("{0}-jar \"{1}\" verify --print-certs \"{2}\"", jvmArgs, JarPath, apkFile),
+                CreateNoWindow = true,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                StandardOutputEncoding = Encoding.UTF8,
+                StandardErrorEncoding = Encoding.UTF8,
+            };
+
+            var result = new ApkSignatureResult();
+            try
+            {
+                ProcessRunResult run = ProcessRunner.RunAsync(startInfo, timeout, cancellationToken, onProcessStarted)
+                    .GetAwaiter().GetResult();
+
+                result.ProcessId = run.ProcessId;
+                result.ExitCode = run.ExitCode;
+                result.Elapsed = run.Elapsed;
+                result.Output = (run.StandardOutput ?? String.Empty) + (run.StandardError ?? String.Empty);
+
+                if (run.Cancelled) result.Status = ApkSignatureStatus.Cancelled;
+                else if (run.TimedOut) result.Status = ApkSignatureStatus.TimedOut;
+                else result.Status = run.ExitCode == 0 ? ApkSignatureStatus.Success : ApkSignatureStatus.Failed;
+
+                if (result.Status != ApkSignatureStatus.Success && String.IsNullOrWhiteSpace(result.Output))
+                    result.Output = "apksigner returned exit code " + run.ExitCode;
+            }
+            catch (OperationCanceledException)
+            {
+                result.Status = ApkSignatureStatus.Cancelled;
+            }
+            catch (Exception ex)
+            {
+                result.Status = ApkSignatureStatus.Failed;
+                result.Output = ex.Message;
+            }
+
+            return result;
+        }
+
 
         public new void Dispose()
         {
@@ -242,5 +299,23 @@ namespace APKToolGUI
                 return message;
             }
         }
+    }
+
+    public enum ApkSignatureStatus
+    {
+        Success,
+        Failed,
+        TimedOut,
+        Cancelled,
+    }
+
+    /// <summary>Result of a single signature verification run.</summary>
+    public sealed class ApkSignatureResult
+    {
+        public ApkSignatureStatus Status { get; set; }
+        public string Output { get; set; }
+        public int ExitCode { get; set; }
+        public int ProcessId { get; set; }
+        public TimeSpan Elapsed { get; set; }
     }
 }

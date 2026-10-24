@@ -97,6 +97,8 @@
                         <ComboBox x:Name="cboTheme" Grid.Row="9" Grid.Column="1" Margin="16,3,0,3" HorizontalAlignment="Left" Width="160"/>
 
                         <CheckBox x:Name="chkDebug" Grid.Row="10" Grid.ColumnSpan="3" Margin="0,3"/>
+                        <CheckBox x:Name="chkAutoVerifySignature" Grid.Row="11" Grid.ColumnSpan="3" Margin="0,3"
+                                  Content="Automatically verify APK signatures after basic information is loaded."/>
                     </Grid>
                 </GroupBox>
 

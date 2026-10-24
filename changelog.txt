@@ -1,3 +1,17 @@
+Unreleased (APK Info work)
+- APK Info: basic information is shown before the launcher icon and before any signature work
+- APK Info: the icon is resolved afterwards and the resolution source (direct, resource table, split) is logged
+- APK Info: repeated requests for the same file are deduplicated, a new selection cancels the previous request
+  and its results are discarded, and each request uses its own temporary folder that is removed when it ends
+- APK Info: aapt/aapt2 runs have a time limit; a timed out or failed read is reported as such instead of "Done"
+- Signature verification is no longer started automatically: it runs from a button, or automatically when the new
+  "Automatically verify APK signatures" setting is enabled
+- Signature verification shows running/succeeded/failed/cancelled/timed out with elapsed time, can be cancelled,
+  and only terminates the Java process it started, waiting for it to exit before releasing resources
+- Every APK Info / signature child process drains stdout and stderr concurrently and records its PID
+- New File > Export diagnostic snapshot (manual, on demand) for the unconfirmed long-idle slowdown
+- CI: manual workflow_dispatch, component checks, and a versioned ZIP artifact containing the full runtime
+
 3.4.0.0
 - Ported WinForm to WPF for better performance
 - Merged all WinForm Languages into Languages folder

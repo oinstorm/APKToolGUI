@@ -13,8 +13,23 @@ using System.Windows.Documents;
 
 namespace APKToolGUI.Utils
 {
+    public enum ApkParseStatus
+    {
+        Success,
+        ToolFailed,
+        TimedOut,
+    }
+
+
     public class AaptParser
     {
+        // Outcome of the most recent Parse call so callers can report tool failure or timeout
+        // separately from a successful read.
+        public ApkParseStatus LastStatus { get; private set; }
+        public string LastError { get; private set; }
+        // Which strategy resolved the launcher icon (direct entry, resource table or split APK).
+        public string LastIconSource { get; private set; }
+
         public string ApkFile;
 
         public string RealApkFile;
@@ -89,9 +104,17 @@ namespace APKToolGUI.Utils
 
         public bool Parse(string file)
         {
-            bool result = true;
+            return Parse(file, Timeout.InfiniteTimeSpan, CancellationToken.None, null);
+        }
 
-            string info = ParseApkInfo(file);
+        public bool Parse(string file, TimeSpan timeout, CancellationToken cancellationToken, Action<int, DateTime> onProcessStarted)
+        {
+            bool result = true;
+            LastStatus = ApkParseStatus.Success;
+            LastError = null;
+            LastIconSource = null;
+            NativeCode = null;
+            string info = ParseApkInfo(file, timeout, cancellationToken, onProcessStarted);
 
             FullInfo = info;
 
@@ -173,27 +196,46 @@ namespace APKToolGUI.Utils
                 result = true;
             }
             else
+            {
                 result = false;
+                if (LastStatus == ApkParseStatus.Success) LastStatus = ApkParseStatus.ToolFailed;
+            }
 
             return result;
         }
 
-        private string ParseApkInfo(string path)
+        private string ParseApkInfo(string path, TimeSpan timeout, CancellationToken cancellationToken, Action<int, DateTime> onProcessStarted)
         {
             //For some reason, aapt2 hangs, so we will only use aapt2 when aapt1 fails to read UTF-8 character
-            string apkinfo = CMD.ProcessStartWithOutput(Program.AAPT_PATH, "dump badging \"" + path + "\"");
-            if (String.IsNullOrEmpty(apkinfo))
+            string args = "dump badging \"" + path + "\"";
+            ProcessRunResult first = CMD.TryRun(Program.AAPT_PATH, args, timeout, cancellationToken, onProcessStarted);
+            if (first != null && first.TimedOut)
             {
-                string apkinfo2 = CMD.ProcessStartWithOutput(Program.AAPT2_PATH, "dump badging \"" + path + "\"");
-                if (!String.IsNullOrEmpty(apkinfo2))
-                {
-                    return apkinfo2;
-                }
-                else
-                    return "";
+                LastStatus = ApkParseStatus.TimedOut;
+                LastError = "aapt exceeded the " + (int)timeout.TotalSeconds + "s limit";
+                return "";
             }
-            else
-                return apkinfo;
+
+            string apkinfo = first == null ? "" : (first.StandardOutput ?? "").Trim();
+            if (!String.IsNullOrEmpty(apkinfo)) return apkinfo;
+
+            cancellationToken.ThrowIfCancellationRequested();
+            ProcessRunResult second = CMD.TryRun(Program.AAPT2_PATH, args, timeout, cancellationToken, onProcessStarted);
+            if (second != null && second.TimedOut)
+            {
+                LastStatus = ApkParseStatus.TimedOut;
+                LastError = "aapt2 exceeded the " + (int)timeout.TotalSeconds + "s limit";
+                return "";
+            }
+
+            string apkinfo2 = second == null ? "" : (second.StandardOutput ?? "").Trim();
+            if (!String.IsNullOrEmpty(apkinfo2)) return apkinfo2;
+
+            LastStatus = ApkParseStatus.ToolFailed;
+            LastError = first == null && second == null
+                ? "the aapt tools could not be started"
+                : "aapt and aapt2 returned no output";
+            return "";
         }
 
         // mipmap/drawable density folders to probe when the manifest points at an adaptive XML icon.
@@ -229,12 +271,14 @@ namespace APKToolGUI.Utils
 
                 // 1) Direct raster lookup inside the (base) APK.
                 byte[] iconBytes = ReadIconFromApk(apkPath, candidates);
+                if (iconBytes != null) LastIconSource = "direct";
 
-                // 2) resources.arsc fallback.
+                // 2) resources.arsc fallback, only when the direct lookup missed.
                 if (iconBytes == null)
                 {
                     Debug.WriteLine("Falling back to resources.arsc extraction method");
                     iconBytes = ApkIconExtractor.ExtractIcon(apkPath);
+                    if (iconBytes != null) LastIconSource = "resource-table";
                 }
 
                 // 3) Split-APK fallback: density resources (incl. the launcher icon) usually live
@@ -250,13 +294,17 @@ namespace APKToolGUI.Utils
                         if (iconBytes != null)
                         {
                             Debug.WriteLine("Icon resolved from split: " + Path.GetFileName(split));
+                            LastIconSource = "split";
                             break;
                         }
                     }
                 }
 
                 if (iconBytes == null)
+                {
+                    LastIconSource = "none";
                     Debug.WriteLine("Icon not found in " + Path.GetFileName(apkPath));
+                }
 
                 return iconBytes;
             }

@@ -38,6 +38,19 @@ If you remain unsure, you can compile the app yourself or refrain from using it 
 - High DPI support
 - Long path support (Windows 10 and above) 
 
+# APK Info behaviour (this fork)
+- Basic information (package, version, SDK levels, permissions, AAPT dump) is shown as soon as the manifest has
+  been read. The launcher icon is resolved afterwards and never blocks the basic fields.
+- Signature verification is on demand: use **Verify signature** on the APK Info > Signature tab. Enable
+  **Automatically verify APK signatures** in Settings to keep the previous behaviour.
+- While signature verification runs, apksigner may keep the APK open. The status line says so, the run can be
+  cancelled, and the Java process it started is terminated and awaited before the result is discarded.
+- **File > Export diagnostic snapshot...** writes one text file on demand (no background sampling) with version,
+  commit, uptime, memory, handles, threads, GDI/USER objects, active APK Info requests, owned child process PIDs
+  and the last UI dispatch delay. It only records file names, never APK contents or folder layout.
+  A slowdown after more than an hour of idling has not been reproduced, so its root cause is still unknown; the
+  snapshot is a diagnostic aid, not a fix.
+
 # Languages
 - English
 - Brazilian Portuguese (Incomplete)

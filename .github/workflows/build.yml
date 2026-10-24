@@ -5,6 +5,7 @@ on:
     branches: [ "master" ]
   pull_request:
     branches: [ "master" ]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -24,24 +25,87 @@ jobs:
     - name: Restore NuGet Packages
       run: nuget restore APKToolGUI.sln
 
+    - name: Stamp build metadata
+      shell: pwsh
+      # Placeholder values are replaced so a diagnostic snapshot can name the exact build.
+      run: |
+        $commit = "${{ github.sha }}".Substring(0, 7)
+        $content = @"
+namespace APKToolGUI.Properties
+{
+    internal static class BuildInfo
+    {
+        internal const string Commit = "$commit";
+        internal const string BuildConfiguration = "Release";
+    }
+}
+"@
+        Set-Content -Path APKToolGUI/Properties/BuildInfo.cs -Value $content -Encoding UTF8
+        Write-Host "Stamped commit $commit"
+
     - name: Build Application
-      run: msbuild APKToolGUI.sln /p:Configuration=Release
+      run: msbuild APKToolGUI.sln /p:Configuration=Release /m
 
-    - name: Create package directory
-      run: mkdir package
-
-    - name: Copy essential files to package
+    - name: Run component checks
       shell: pwsh
       run: |
-        Copy-Item APKToolGUI/bin/Release/APKToolGUI.exe package/
-        Copy-Item changelog.txt package/Changelog.txt
+        $testExe = "tests/APKToolGUI.Tests/bin/Release/APKToolGUI.Tests.exe"
+        if (-not (Test-Path $testExe)) { throw "Test executable was not built: $testExe" }
+        & $testExe
+        if ($LASTEXITCODE -ne 0) { throw "Component checks failed with exit code $LASTEXITCODE" }
 
-        if (Test-Path APKToolGUI/bin/Release/Resources) {
-          Copy-Item APKToolGUI/bin/Release/Resources package/ -Recurse
-        }
+    - name: Create package directory
+      shell: pwsh
+      # Collect the whole Release output plus the runtime tools, not only the EXE.
+      run: |
+        $out = "APKToolGUI/bin/Release"
+        New-Item -ItemType Directory -Path package -Force | Out-Null
+        Copy-Item "$out/APKToolGUI.exe" package/
+        if (Test-Path "$out/APKToolGUI.exe.config") { Copy-Item "$out/APKToolGUI.exe.config" package/ }
+        if (Test-Path "$out/Resources") { Copy-Item "$out/Resources" package/ -Recurse }
+        Copy-Item changelog.txt package/Changelog.txt
+        Copy-Item README.md package/Readme.md
+
+        $version = (Get-Item "package/APKToolGUI.exe").VersionInfo.ProductVersion
+        $short = "${{ github.sha }}".Substring(0, 7)
+        "PACKAGE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "SHORT_SHA=$short" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        Write-Host "Packaged version $version ($short)"
+
+    - name: Verify package contents
+      shell: pwsh
+      run: |
+        $required = @(
+          "package/APKToolGUI.exe",
+          "package/Resources/aapt.exe",
+          "package/Resources/aapt2.exe",
+          "package/Resources/apktool.jar",
+          "package/Resources/apksigner.jar",
+          "package/Resources/zipalign.exe",
+          "package/Resources/testkey.pk8"
+        )
+        $missing = $required | Where-Object { -not (Test-Path $_) }
+        if ($missing) { throw "Package is incomplete, missing: $($missing -join ', ')" }
+
+        # No APK sample and no local path may ever be shipped.
+        $samples = Get-ChildItem package -Recurse -File |
+          Where-Object { $_.Extension -in ".apk", ".xapk", ".apks", ".apkm" }
+        if ($samples) { throw "The package must not contain APK samples: $($samples.FullName -join ', ')" }
+
+        $total = Get-ChildItem package -Recurse -File | Measure-Object -Property Length -Sum
+        Write-Host ("Package files: {0}, total bytes: {1}" -f $total.Count, $total.Sum)
+
+    - name: Create ZIP
+      shell: pwsh
+      run: |
+        $name = "APKToolGUI-$env:PACKAGE_VERSION-$env:SHORT_SHA-Release"
+        Compress-Archive -Path package/* -DestinationPath "$name.zip"
+        "ZIP_NAME=$name" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        Write-Host "Created $name.zip"
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: APKToolGUI
-        path: package/
+        name: ${{ env.ZIP_NAME }}
+        path: ${{ env.ZIP_NAME }}.zip
+        if-no-files-found: error
