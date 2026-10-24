@@ -30,16 +30,16 @@ jobs:
       # Placeholder values are replaced so a diagnostic snapshot can name the exact build.
       run: |
         $commit = "${{ github.sha }}".Substring(0, 7)
-        $content = @"
-namespace APKToolGUI.Properties
-{
-    internal static class BuildInfo
-    {
-        internal const string Commit = "$commit";
-        internal const string BuildConfiguration = "Release";
-    }
-}
-"@
+        $content = @(
+          "namespace APKToolGUI.Properties",
+          "{",
+          "    internal static class BuildInfo",
+          "    {",
+          "        internal const string Commit = ""$commit"";",
+          "        internal const string BuildConfiguration = ""Release"";",
+          "    }",
+          "}"
+        )
         Set-Content -Path APKToolGUI/Properties/BuildInfo.cs -Value $content -Encoding UTF8
         Write-Host "Stamped commit $commit"
 
